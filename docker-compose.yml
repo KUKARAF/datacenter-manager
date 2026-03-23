@@ -1,0 +1,55 @@
+# Osmosis node — WireGuard mesh + Caddy reverse proxy + coordinator
+#
+# All three services use network_mode: host so that:
+#   - WireGuard creates wg0 (10.10.0.x) in the host network namespace
+#   - Caddy can reach wg0 IPs for remote reverse_proxy targets
+#   - Caddy can bind :80 / :443 directly
+#   - Coordinator can reach Caddy admin API (:2019) and serve :9123 on the WireGuard IP
+#
+# Required: .env with API_KEY and SECRET_KEY (Porkbun credentials)
+
+services:
+
+  wireguard:
+    image: linuxserver/wireguard:latest
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - ./config/wireguard:/config          # wg0.conf written here by coordinator
+      - /lib/modules:/lib/modules:ro
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1  # required for WireGuard routing marks
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:latest
+    network_mode: host
+    volumes:
+      - ./config/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # TLS certs (persisted across restarts)
+      - caddy_config:/config  # Caddy internal state
+    restart: unless-stopped
+    depends_on:
+      - wireguard
+
+  coordinator:
+    build: .
+    network_mode: host
+    env_file: .env
+    environment:
+      # Caddy admin API — coordinator POSTs new config here on each cycle
+      CADDY_ADMIN_URL: "http://localhost:2019"
+      # WireGuard config path — coordinator writes wg0.conf here, then runs wg syncconf
+      WG_CONFIG_PATH: "/app/config/wireguard/wg0.conf"
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped
+    depends_on:
+      - caddy
+      - wireguard
+
+volumes:
+  caddy_data:
+  caddy_config:

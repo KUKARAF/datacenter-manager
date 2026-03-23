@@ -6,3 +6,7 @@ dist/
 build/
 .venv/
 *.log
+
+# WireGuard private keys — never commit
+config/wireguard/wg0.conf
+config/wireguard/*.conf

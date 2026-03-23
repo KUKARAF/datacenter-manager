@@ -1,0 +1,8 @@
+# Initial Caddyfile — coordinator overwrites this on first cycle via admin API.
+# Admin API is intentionally bound to localhost only (not exposed publicly).
+{
+	admin localhost:2019
+}
+
+# Placeholder: coordinator will push the real config via POST /load
+# once it has completed health checks and determined active nodes.
