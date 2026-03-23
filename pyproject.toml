@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datacenter-manager"
+version = "0.1.0"
+description = "Datacenter coordinator: DNS management, WireGuard topology, service health"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "KUKARAF"},
+]
+keywords = ["datacenter", "dns", "porkbun", "wireguard", "caddy"]
+
+dependencies = [
+    "Flask>=2.0",
+    "PyYAML>=6.0",
+    "requests>=2.28",
+    "dnspython>=2.4",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+datacenter-manager = "datacenter_manager.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["datacenter_manager*"]
