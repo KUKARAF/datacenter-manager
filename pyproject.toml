@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-datacenter-manager = "datacenter_manager.__main__:main"
+datacenter-manager = "datacenter_manager.datacenter:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

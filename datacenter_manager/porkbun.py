@@ -134,6 +134,17 @@ class PorkbunClient:
         """Update <subdomain>.osmosis.page A record to ip."""
         self.update_record(_INTRANET_DOMAIN, ip, subdomain=subdomain)
 
+    def delete_record(self, domain: str, subdomain: str = "") -> None:
+        """
+        Delete the A record for <subdomain>.<domain> via Porkbun deleteByNameType.
+
+        Args:
+            domain:    Apex domain, e.g. "osmosis.page".
+            subdomain: Subdomain label, e.g. "jellyfin". Empty string deletes the apex record.
+        """
+        path = f"/dns/deleteByNameType/{domain}/A/{subdomain}".rstrip("/")
+        self._post(path)
+
     # ------------------------------------------------------------------
     # Convenience: ping (returns this machine's public IP, no quota cost)
     # ------------------------------------------------------------------

@@ -1,108 +1,36 @@
-import os
+import glob
 import subprocess
-import sys
+import threading
+import time
 import yaml
 from flask import Flask, Response
 
-# Direct import of the Service class from the same package.
-# The Service implementation resides in datacenter_manager/service.py.
+from .porkbun import PorkbunClient, _INTRANET_DOMAIN
 from .service import Service
+
+_CYCLE_INTERVAL = 300  # seconds — roughly half the DNS TTL
+
+# Latest datacenter snapshot, updated each cycle, served by Flask.
+_snapshot: dict = {}
+_snapshot_lock = threading.Lock()
 
 
 class Datacenter:
     """
-    Represents a datacenter configuration.
+    Snapshot of this node's identity, services, and public IP.
 
     Attributes:
-        name (str): Name of the datacenter (obtained from Tailscale).
-        services (list[Service]): List of Service instances running in this datacenter.
-        public_ip (str): Current public IP address of the datacenter.
+        name (str): Tailscale hostname of this node.
+        services (list[Service]): Services discovered on this node.
+        public_ip (str | None): Current public IP reported by Porkbun /ping.
     """
 
-    def __init__(self):
-        """
-        Initialise the Datacenter.
-        The datacenter name is automatically obtained from Tailscale.
-        """
-        # Get the datacenter name from Tailscale
+    def __init__(self, public_ip: str, services: list):
         self.name = _get_tailscale_hostname()
+        self.public_ip = public_ip
+        self.services = services
 
-        # Load running services for this datacenter
-        self.services = self._discover_services()
-
-        # Determine the current public IP using icanhazip.com as fallback
-        self.public_ip = self._get_public_ip()
-
-    def _discover_services(self) -> list:
-        """
-        Discover all available services by searching for service-config.yaml files.
-        
-        Returns:
-            list: List of Service instances found in the system.
-        """
-        import glob
-        
-        services = []
-        
-        # Search for service-config.yaml files in common locations
-        # Start with the current directory and common service directories
-        search_patterns = [
-            "**/service-config.yaml",
-            "*/service-config.yaml",
-        ]
-        
-        found_files = []
-        for pattern in search_patterns:
-            try:
-                # Use glob to find files recursively
-                files = glob.glob(pattern, recursive=True)
-                found_files.extend(files)
-            except Exception as exc:
-                print(f"Warning: Could not search for services with pattern {pattern}: {exc}")
-                continue
-        
-        # Remove duplicates while preserving order
-        unique_files = []
-        seen = set()
-        for file in found_files:
-            if file not in seen:
-                seen.add(file)
-                unique_files.append(file)
-        
-        # Create Service instances for each found config file
-        for config_file in unique_files:
-            try:
-                # Import Service class here to avoid circular imports
-                from .service import Service
-                service = Service(config_file)
-                services.append(service)
-                print(f"Discovered service: {service.domain} from {config_file}")
-            except Exception as exc:
-                print(f"Warning: Could not load service from {config_file}: {exc}")
-                continue
-        
-        return services
-
-    def _get_public_ip(self) -> str:
-        """
-        Get the current public IP address.
-        
-        Returns:
-            str: The public IP address, or None if it cannot be determined.
-        """
-        try:
-            import requests
-            # Try to get the public IP using icanhazip.com
-            response = requests.get("https://icanhazip.com", timeout=10)
-            response.raise_for_status()
-            # Strip whitespace from the response
-            return response.text.strip()
-        except Exception as exc:
-            print(f"Warning: could not determine public IP ({exc}); using None")
-            return None
-
-    def to_dict(self):
-        """Return a dictionary representation suitable for YAML serialization."""
+    def to_dict(self) -> dict:
         return {
             "name": self.name,
             "public_ip": self.public_ip,
@@ -110,71 +38,208 @@ class Datacenter:
         }
 
 
-def _create_flask_app(datacenter: Datacenter) -> Flask:
-    """
-    Create a Flask application that serves the datacenter information as YAML.
-    """
+# ---------------------------------------------------------------------------
+# Service discovery
+# ---------------------------------------------------------------------------
+
+def _discover_services() -> list[Service]:
+    """Search cwd recursively for service-config.yaml files and return Service list."""
+    found = set()
+    for pattern in ("**/service-config.yaml", "*/service-config.yaml"):
+        try:
+            found.update(glob.glob(pattern, recursive=True))
+        except Exception as exc:
+            print(f"[WARN] Service discovery pattern {pattern!r} failed: {exc}")
+
+    services = []
+    for path in sorted(found):
+        try:
+            svc = Service(path)
+            print(f"[INFO] Discovered service: {svc.domain} ({path})")
+            services.append(svc)
+        except Exception as exc:
+            print(f"[WARN] Could not load service from {path}: {exc}")
+    return services
+
+
+# ---------------------------------------------------------------------------
+# Service lifecycle
+# ---------------------------------------------------------------------------
+
+def _start_service(svc: Service) -> None:
+    """Run `docker compose up -d` in the service directory."""
+    subprocess.run(
+        ["docker", "compose", "up", "-d"],
+        cwd=svc.service_dir,
+        check=True,
+    )
+    print(f"[INFO] Started {svc.domain} via docker compose")
+
+
+def _stop_service(svc: Service) -> None:
+    """Run `docker compose down` in the service directory."""
+    subprocess.run(
+        ["docker", "compose", "down"],
+        cwd=svc.service_dir,
+        check=True,
+    )
+    print(f"[INFO] Stopped {svc.domain} via docker compose")
+
+
+# ---------------------------------------------------------------------------
+# Coordinator cycle
+# ---------------------------------------------------------------------------
+
+def _run_cycle(pb: PorkbunClient) -> None:
+    my_node = _get_tailscale_hostname()
+    my_ip = pb.get_my_public_ip()
+    wg_ips = pb.get_wg_ips()
+
+    # 1. Keep this node's own A record current.
+    pb.update_node_ip(my_node, my_ip)
+    print(f"[INFO] Updated {my_node}.{_INTRANET_DOMAIN} → {my_ip}")
+
+    # 2. Discover services each cycle so newly added ones are picked up.
+    services = _discover_services()
+
+    # 3. Update the Flask snapshot.
+    with _snapshot_lock:
+        _snapshot.update(Datacenter(my_ip, services).to_dict())
+
+    # 4. For each service this node is listed in, handle failover and DNS.
+    for svc in services:
+        if my_node not in svc.data_centers:
+            continue
+
+        _handle_service(pb, svc, my_node, my_ip, wg_ips)
+
+
+def _handle_service(
+    pb: PorkbunClient,
+    svc: Service,
+    my_node: str,
+    my_ip: str,
+    wg_ips: dict[str, str],
+) -> None:
+    """Decide whether this node should own the service, start it, or stand by."""
+
+    # Derive subdomain + apex — only osmosis.page supported for now.
+    if svc.domain == _INTRANET_DOMAIN:
+        subdomain, apex = "", _INTRANET_DOMAIN
+    elif svc.domain.endswith(f".{_INTRANET_DOMAIN}"):
+        subdomain = svc.domain.removesuffix(f".{_INTRANET_DOMAIN}")
+        apex = _INTRANET_DOMAIN
+    else:
+        print(f"[WARN] {svc.domain}: non-osmosis domain not yet supported, skipping")
+        return
+
+    try:
+        port = svc.get_port()
+    except RuntimeError as exc:
+        print(f"[WARN] {svc.domain}: {exc}")
+        return
+
+    my_index = svc.data_centers.index(my_node)
+    higher_priority_nodes = svc.data_centers[:my_index]
+
+    # Check if any higher-priority node is already running the service.
+    for node in higher_priority_nodes:
+        wg_ip = wg_ips.get(node)
+        if not wg_ip:
+            print(f"[WARN] {svc.domain}: no WireGuard IP known for {node!r}, skipping it")
+            continue
+        if svc.is_port_up(port, host=wg_ip):
+            print(f"[INFO] {svc.domain} is healthy on {node} ({wg_ip}:{port}) — standing by")
+            return
+
+    # No higher-priority node is healthy. This node should own the service.
+    local_healthy = svc.is_port_up(port)
+
+    if local_healthy:
+        pb.update_record(apex, my_ip, subdomain=subdomain)
+        print(f"[INFO] {svc.domain} healthy locally — A → {my_ip}")
+        return
+
+    # Service is not running locally — start it.
+    print(f"[INFO] {svc.domain} is down and no higher-priority node is healthy — starting locally")
+    try:
+        _start_service(svc)
+    except subprocess.CalledProcessError as exc:
+        print(f"[ERROR] {svc.domain}: docker compose up failed: {exc}")
+        return
+
+    # Update DNS optimistically; next cycle confirms health via is_port_up.
+    pb.update_record(apex, my_ip, subdomain=subdomain)
+    print(f"[INFO] {svc.domain} started — A → {my_ip} (health confirmed next cycle)")
+
+
+def coordinator_loop() -> None:
+    """Run _run_cycle every _CYCLE_INTERVAL seconds, logging but not dying on errors."""
+    pb = PorkbunClient()
+    while True:
+        try:
+            _run_cycle(pb)
+        except Exception as exc:
+            print(f"[ERROR] Coordinator cycle failed: {exc}")
+        time.sleep(_CYCLE_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Flask introspection server
+# ---------------------------------------------------------------------------
+
+def _create_flask_app() -> Flask:
     app = Flask(__name__)
 
     @app.route("/", methods=["GET"])
     def get_datacenter_yaml():
-        yaml_content = yaml.safe_dump(datacenter.to_dict())
-        return Response(yaml_content, mimetype="application/x-yaml")
+        with _snapshot_lock:
+            content = yaml.safe_dump(dict(_snapshot))
+        return Response(content, mimetype="application/x-yaml")
 
     return app
 
 
-def _get_tailscale_hostname() -> str:
-    """
-    Retrieve the Tailscale hostname for the current machine.
+# ---------------------------------------------------------------------------
+# Tailscale hostname helper
+# ---------------------------------------------------------------------------
 
-    Returns:
-        str: The hostname obtained from `tailscale status --self`.
-    """
+def _get_tailscale_hostname() -> str:
     try:
-        # Run the tailscale command and capture its output.
         result = subprocess.run(
             ["tailscale", "status", "--self"],
-            capture_output=True,
-            text=True,
-            check=True,
+            capture_output=True, text=True, check=True,
         )
-        # The output format is: "<self-id> <hostname> ..."
-        # We extract the second whitespace‑separated field.
-        hostname = result.stdout.split()[1]
-        return hostname
+        return result.stdout.split()[1]
     except Exception as exc:
-        # If anything goes wrong, fall back to localhost and log the error.
-        print(f"Warning: could not determine Tailscale hostname ({exc}); using '127.0.0.1'")
-        return "127.0.0.1"
+        print(f"[WARN] Could not determine Tailscale hostname ({exc}); using 'localhost'")
+        return "localhost"
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     """
-    Entry‑point used by the console script and ``python -m datacenter_manager``.
-    Creates a Datacenter instance and runs the Flask development server.
+    Start the coordinator loop and the Flask introspection server.
+
+    The coordinator loop runs in the main thread.
+    Flask runs in a daemon thread on the Tailscale IP, port 9123.
     """
-    # Example usage: create a Datacenter instance and serve its YAML representation.
-    # The datacenter name is passed via an environment variable.
-    # This is a required parameter - there should be no fallback to a default value.
-    dc_name = os.getenv("DATACENTER_NAME")
-    if not dc_name:
-        raise RuntimeError(
-            "DATACENTER_NAME environment variable is not set. "
-            "Please set DATACENTER_NAME to the name of your datacenter before running this service."
-        )
-    dc = Datacenter()
-
-    flask_app = _create_flask_app(dc)
-
-    # Determine host and port as per the new requirements.
+    flask_app = _create_flask_app()
     host = _get_tailscale_hostname()
-    port = 9123
 
-    # Run the Flask development server; in production you would use a proper WSGI server.
-    flask_app.run(host=host, port=port)
+    flask_thread = threading.Thread(
+        target=lambda: flask_app.run(host=host, port=9123),
+        daemon=True,
+        name="flask-introspection",
+    )
+    flask_thread.start()
+    print(f"[INFO] Introspection server listening on http://{host}:9123/")
+
+    coordinator_loop()
 
 
 if __name__ == "__main__":
-    # When executed directly, invoke the same entry‑point.
     main()
